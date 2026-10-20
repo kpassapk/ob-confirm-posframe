@@ -41,6 +41,18 @@
 ;;   n  cancel the whole chain (nothing else in it runs)
 ;;   !  run this block and the rest of the chain without asking
 ;;   e  cancel the chain and jump to this block
+;;   d  view the notices in full (only when there are notices)
+;;
+;; Functions on `ob-confirm-posframe-notice-functions' add highlighted
+;; lines above the body: why this run deserves a second look.  A
+;; notice made with `ob-confirm-posframe-notice' can carry a longer
+;; detail, such as a multi-file diff, which `d' shows in a `diff-mode'
+;; buffer; `q' there returns to the prompt.
+;;
+;; With `ob-confirm-posframe-expand-noweb' on, the body shows with its
+;; noweb references expanded: the text that runs.  A call such as
+;; `<<name()>>' would run the named block to expand it, so it is shown
+;; as written, with a notice, and never run before you answer.
 ;;
 ;; In a terminal frame, where posframe cannot work, the same preview
 ;; shows in a fixed-height side window.
@@ -91,6 +103,23 @@ Each is called with the block INFO, as returned by
 `org-babel-get-src-block-info', and returns a string or nil."
   :type 'hook)
 
+(defcustom ob-confirm-posframe-notice-functions nil
+  "Functions adding notices above the body in the preview.
+Each is called with the block INFO, as returned by
+`org-babel-get-src-block-info', and returns a notice, a list of
+notices, or nil.  A notice is a one-line string; make one with
+`ob-confirm-posframe-notice' to give it a longer detail, which
+the `d' key shows in a `diff-mode' buffer."
+  :type 'hook)
+
+(defcustom ob-confirm-posframe-expand-noweb nil
+  "Non-nil means show the body with its noweb references expanded.
+This applies to blocks whose `:noweb' header expands on
+evaluation.  A plain reference `<<name>>' is replaced with the
+text it stands for.  A call `<<name()>>' would run the named
+block, so it is shown as written, with a notice."
+  :type 'boolean)
+
 (defface ob-confirm-posframe-title
   '((t :inherit bold))
   "Face for the block name in the preview.")
@@ -98,6 +127,10 @@ Each is called with the block INFO, as returned by
 (defface ob-confirm-posframe-dim
   '((t :inherit shadow))
   "Face for secondary text in the preview.")
+
+(defface ob-confirm-posframe-notice
+  '((t :inherit warning))
+  "Face for notices in the preview.")
 
 (defface ob-confirm-posframe-key
   '((t :inherit help-key-binding))
@@ -109,6 +142,9 @@ Each is called with the block INFO, as returned by
 
 (defconst ob-confirm-posframe--buffer " *ob-confirm-posframe*"
   "Buffer holding the preview.")
+
+(defconst ob-confirm-posframe--notice-buffer "*ob-confirm-posframe notices*"
+  "Buffer showing the notices in full.")
 
 (define-error 'ob-confirm-posframe-cancelled
               "Evaluation cancelled" 'user-error)
@@ -180,12 +216,14 @@ them before `org-babel-execute-src-block' is entered."
 
 ;;;; Confirmation
 
-(defun ob-confirm-posframe--read-answer (info)
-  "Read an answer for the block INFO: one of ?y, ?n, ?! or ?e."
+(defun ob-confirm-posframe--read-answer (info &optional notices)
+  "Read an answer for the block INFO: one of ?y, ?n, ?!, ?e or ?d.
+?d is offered only when there are NOTICES."
   (read-char-choice
-   (format "Run %s? (y, n, !, e) "
-           (or (nth 4 info) (format "this %s block" (nth 0 info))))
-   '(?y ?n ?! ?e)))
+   (format "Run %s? (y, n, !, e%s) "
+           (or (nth 4 info) (format "this %s block" (nth 0 info)))
+           (if notices ", d" ""))
+   (if notices '(?y ?n ?! ?e ?d) '(?y ?n ?! ?e))))
 
 (defun ob-confirm-posframe--confirm-advice (fn info)
   "Around advice for `org-babel-confirm-evaluate'.
@@ -223,14 +261,25 @@ FN is the original function and INFO the block being confirmed."
       (org-fold-show-context))))
 
 (defun ob-confirm-posframe--ask (info chain)
-  "Preview the block INFO of CHAIN and return the user's answer."
-  (let ((preview (ob-confirm-posframe--render info chain)))
+  "Preview the block INFO of CHAIN and return the user's answer.
+The answer ?d shows the notices in full, then asks again."
+  (let* ((expanded (ob-confirm-posframe--expanded-body info))
+         (notices (ob-confirm-posframe--notices info (cdr expanded)))
+         (preview (ob-confirm-posframe--render
+                   info chain notices (car expanded))))
     (ob-confirm-posframe--call-at-origin
      chain
      (lambda ()
-       (ob-confirm-posframe--show preview)
-       (unwind-protect (ob-confirm-posframe--read-answer info)
-         (ob-confirm-posframe--hide))))))
+       (let (answer)
+         (while (eq ?d (setq answer
+                             (progn
+                               (ob-confirm-posframe--show preview)
+                               (unwind-protect
+                                   (ob-confirm-posframe--read-answer
+                                    info notices)
+                                 (ob-confirm-posframe--hide)))))
+           (ob-confirm-posframe--view-notices notices))
+         answer)))))
 
 (defun ob-confirm-posframe--call-at-origin (chain thunk)
   "Call THUNK with point and window back at CHAIN's origin.
@@ -251,6 +300,106 @@ for the duration of the prompt keeps the view still."
             (set-window-point win origin)
             (set-window-start win (ob-confirm-posframe--chain-start chain) t)
             (funcall thunk)))))))
+
+;;;; Notices
+
+(defun ob-confirm-posframe-notice (line &optional detail)
+  "Return a notice showing LINE, with DETAIL behind the `d' key.
+DETAIL is a string, such as a unified diff, or a function of no
+arguments returning one, called only when the notice is viewed.
+Without DETAIL, `d' shows LINE itself."
+  (if detail
+      (propertize line 'ob-confirm-posframe-detail detail)
+    line))
+
+(defun ob-confirm-posframe--notice-detail (notice)
+  "Return the detail of NOTICE as a string, or nil when it has none.
+A detail function that fails returns its error instead, so the
+prompt survives it."
+  (let ((detail (get-text-property 0 'ob-confirm-posframe-detail notice)))
+    (if (functionp detail)
+        (condition-case err (funcall detail)
+          (error (format "Detail failed: %s" (error-message-string err))))
+      detail)))
+
+(defun ob-confirm-posframe--notices (info &optional calls)
+  "Return the notices for the block INFO, in order.
+They come from `ob-confirm-posframe-notice-functions', then one
+per noweb call in CALLS."
+  (append
+   (seq-filter
+    (lambda (n) (and (stringp n) (not (string-empty-p n))))
+    (mapcan (lambda (f)
+              (let ((r (funcall f info)))
+                (if (listp r) (copy-sequence r) (list r))))
+            ob-confirm-posframe-notice-functions))
+   (mapcar (lambda (c) (format "noweb call: %s" c)) calls)))
+
+(defun ob-confirm-posframe--expanded-body (info)
+  "Return (BODY . CALLS) for the block INFO, or nil.
+BODY has the noweb references expanded, and CALLS lists each call
+`<<name()>>', which stays as written in BODY.  Return nil unless
+`ob-confirm-posframe-expand-noweb' is on and INFO expands noweb
+on evaluation.  Expansion runs in the current buffer, which must
+hold the block."
+  (when (and ob-confirm-posframe-expand-noweb
+             (org-babel-noweb-p (nth 2 info) :eval))
+    (let (calls)
+      (condition-case err
+          ;; Expanding a call resolves it, which runs the block.  Put
+          ;; it back as written instead, here and in every reference
+          ;; expanded on the way.
+          (cl-letf (((symbol-function 'org-babel-ref-resolve)
+                     (lambda (id)
+                       (cl-pushnew id calls :test #'equal)
+                       (concat org-babel-noweb-wrap-start id
+                               org-babel-noweb-wrap-end))))
+            (cons (org-babel-expand-noweb-references info)
+                  (nreverse calls)))
+        (error
+         (message "ob-confirm-posframe: noweb not expanded: %s"
+                  (error-message-string err))
+         nil)))))
+
+(defun ob-confirm-posframe--view-notices (notices)
+  "Show NOTICES in full in a `diff-mode' window until `q' is pressed.
+Each notice shows its line, then its detail, if any."
+  (let ((buf (get-buffer-create ob-confirm-posframe--notice-buffer)))
+    (with-current-buffer buf
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (dolist (n notices)
+          (let ((detail (ob-confirm-posframe--notice-detail n)))
+            (insert (substring-no-properties n) "\n")
+            (when detail
+              (insert detail)
+              (unless (string-suffix-p "\n" detail) (insert "\n")))
+            (insert "\n"))))
+      (diff-mode)
+      (setq buffer-read-only t)
+      (ob-confirm-posframe-notices-mode 1)
+      (goto-char (point-min)))
+    (save-window-excursion
+      (pop-to-buffer buf)
+      (message "%s returns to the prompt"
+               (propertize "q" 'face 'ob-confirm-posframe-key))
+      (recursive-edit))))
+
+(defun ob-confirm-posframe-notices-quit ()
+  "Return to the prompt, or quit the window outside of one."
+  (interactive)
+  (if (> (recursion-depth) 0)
+      (exit-recursive-edit)
+    (quit-window)))
+
+(defvar-keymap ob-confirm-posframe-notices-mode-map
+  :doc "Keymap for `ob-confirm-posframe-notices-mode'."
+  "q" #'ob-confirm-posframe-notices-quit)
+
+(define-minor-mode ob-confirm-posframe-notices-mode
+  "Minor mode for the buffer showing a prompt's notices.
+\\<ob-confirm-posframe-notices-mode-map>\\[ob-confirm-posframe-notices-quit] returns to the prompt."
+  :lighter nil)
 
 ;;;; Rendering
 
@@ -292,12 +441,28 @@ for the duration of the prompt keeps the view still."
                                ob-confirm-posframe-header-functions)))
      "  ")))
 
-(defun ob-confirm-posframe--body-lines (info)
-  "Return the body of INFO as exactly `ob-confirm-posframe-height' lines."
-  (let* ((h ob-confirm-posframe-height)
-         (lines (split-string
-                 (ob-confirm-posframe--fontify
-                  (string-trim-right (nth 1 info)) (nth 0 info))
+(defun ob-confirm-posframe--notice-lines (notices height)
+  "Return NOTICES as at most HEIGHT highlighted lines."
+  (let* ((lines (mapcar
+                 (lambda (n)
+                   (let ((l (car (split-string n "\n"))))
+                     (add-face-text-property 0 (length l)
+                                             'ob-confirm-posframe-notice t l)
+                     l))
+                 notices))
+         (n (length lines)))
+    (cond
+     ((<= n height) lines)
+     ((<= height 0) nil)
+     (t (append (seq-take lines (1- height))
+                (list (propertize (format "… %d more notices, d to view"
+                                          (- n (1- height)))
+                                  'face 'ob-confirm-posframe-dim)))))))
+
+(defun ob-confirm-posframe--body-lines (body lang h)
+  "Return BODY, fontified as LANG, as exactly H lines."
+  (let* ((lines (split-string
+                 (ob-confirm-posframe--fontify (string-trim-right body) lang)
                  "\n"))
          (n (length lines)))
     (when (> n h)
@@ -307,10 +472,14 @@ for the duration of the prompt keeps the view still."
                                             'face 'ob-confirm-posframe-dim)))))
     (append lines (make-list (max 0 (- h (length lines))) ""))))
 
-(defun ob-confirm-posframe--render (info chain)
+(defun ob-confirm-posframe--render (info chain &optional notices body)
   "Return the preview text for the block INFO of CHAIN.
-It always has `ob-confirm-posframe-height' plus six lines."
-  (let* ((dim (lambda (s) (propertize s 'face 'ob-confirm-posframe-dim)))
+NOTICES show above the body, BODY in place of the block's own.
+It always has `ob-confirm-posframe-height' plus six lines: the
+notices take at most half of the body's lines."
+  (let* ((notice-lines (ob-confirm-posframe--notice-lines
+                        notices (/ ob-confirm-posframe-height 2)))
+         (dim (lambda (s) (propertize s 'face 'ob-confirm-posframe-dim)))
          (key (lambda (k) (propertize k 'face 'ob-confirm-posframe-key)))
          (rule (funcall dim (make-string (1- ob-confirm-posframe-width) ?─)))
          (path (reverse (mapcar (lambda (n) (or n "unnamed"))
@@ -326,12 +495,18 @@ It always has `ob-confirm-posframe-height' plus six lines."
             (funcall dim (if (cdr path) (string-join path " › ") ""))
             (funcall dim (ob-confirm-posframe--param-line info))
             rule)
-      (ob-confirm-posframe--body-lines info)
+      notice-lines
+      (ob-confirm-posframe--body-lines
+       (or body (nth 1 info)) (nth 0 info)
+       (max 0 (- ob-confirm-posframe-height (length notice-lines))))
       (list rule
             (concat (funcall key "y") " run   "
                     (funcall key "n") " cancel chain   "
                     (funcall key "!") " run whole chain   "
-                    (funcall key "e") " jump to block")))
+                    (funcall key "e") " jump to block"
+                    (if notices
+                        (concat "   " (funcall key "d") " notices")
+                      ""))))
      "\n")))
 
 ;;;; Display
@@ -382,8 +557,11 @@ Takes effect only while `org-confirm-babel-evaluate' would ask."
   :group 'ob-confirm-posframe
   (if ob-confirm-posframe-mode
       (progn
+        ;; Outermost, so a block another advice runs while setting
+        ;; up its own block prompts inside that block's chain.
         (advice-add 'org-babel-execute-src-block :around
-                    #'ob-confirm-posframe--execute-advice)
+                    #'ob-confirm-posframe--execute-advice
+                    '((depth . -90)))
         (advice-add 'org-babel-ref-resolve :around
                     #'ob-confirm-posframe--ref-advice)
         (advice-add 'org-babel-confirm-evaluate :around
