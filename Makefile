@@ -5,10 +5,11 @@ TIMEOUT ?= 120
 EL := ob-confirm-posframe.el
 TEST := ob-confirm-posframe-test.el
 
-# package-initialize puts posframe on the load path.
-BATCH := $(EMACS) --batch -L . \
+# package-initialize puts posframe on the load path.  -L . comes
+# after it, so this checkout shadows an installed ob-confirm-posframe.
+BATCH := $(EMACS) --batch \
   --eval "(setq native-comp-enable-subr-trampolines nil)" \
-  --eval "(package-initialize)"
+  --eval "(package-initialize)" -L .
 WATCHDOG := perl -e 'alarm shift; exec @ARGV' $(TIMEOUT)
 
 .PHONY: test test-% compile clean
